@@ -179,7 +179,14 @@ public class Program
             if (isLegacyRoomOnlyUnique && !string.IsNullOrEmpty(name))
             {
                 Console.WriteLine($"Dropping legacy backfill index: {name}");
-                await _backfillCollection.Indexes.DropOneAsync(name);
+                try
+                {
+                    await _backfillCollection.Indexes.DropOneAsync(name);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Legacy index drop skipped ({name}): {ex.Message}");
+                }
             }
         }
 
