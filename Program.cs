@@ -14,6 +14,7 @@ public class Program
 
     private static string? _syncToken;
     private static string _stateFile = "sync_token.txt";
+    private static string _indexerId = "default";
 
     // Backfill behavior
     private static int _backfillPageSize = 200;
@@ -33,6 +34,7 @@ public class Program
         var mongoUri = GetEnv("MONGODB_URI", "mongodb://localhost:27017");
         var mongoDbName = GetEnv("MONGODB_DB", "matrix_index");
 
+        _indexerId = GetEnv("INDEXER_ID", userId);
         _stateFile = GetEnv("INDEXER_SYNC_TOKEN_PATH", _stateFile);
         _backfillPageSize = int.Parse(GetEnv("INDEXER_BACKFILL_PAGE_SIZE", _backfillPageSize.ToString()));
         _backfillWorkers = int.Parse(GetEnv("INDEXER_BACKFILL_WORKERS", _backfillWorkers.ToString()));
@@ -53,7 +55,7 @@ public class Program
         if (!homeserver.StartsWith("http")) homeserver = "https://" + homeserver;
         homeserver = homeserver.TrimEnd('/');
 
-        Console.WriteLine($"Logging into Matrix: {homeserver} as {userId}");
+        Console.WriteLine($"Logging into Matrix: {homeserver} as {userId} (indexer_id={_indexerId})");
 
         string accessToken;
         try
@@ -161,13 +163,37 @@ public class Program
         var evOptions = new CreateIndexOptions { Unique = true };
         await _eventsCollection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(evKeys, evOptions));
 
-        // Backfill state: unique by room_id
-        var bfKeys = Builders<BsonDocument>.IndexKeys.Ascending("room_id");
+        // Backfill state: unique by (indexer_id, room_id) so multiple accounts can share one DB safely.
+        // Also drop legacy unique {room_id:1} index if present (it blocks multi-account use).
+        var existingIndexes = await _backfillCollection.Indexes.ListAsync();
+        var existingIndexDocs = await existingIndexes.ToListAsync();
+        foreach (var idx in existingIndexDocs)
+        {
+            var name = idx.GetValue("name", "").ToString();
+            var unique = idx.GetValue("unique", false).ToBoolean();
+            var keyDoc = idx.GetValue("key", new BsonDocument()).AsBsonDocument;
+            var isLegacyRoomOnlyUnique = unique
+                && keyDoc.ElementCount == 1
+                && keyDoc.Contains("room_id");
+
+            if (isLegacyRoomOnlyUnique && !string.IsNullOrEmpty(name))
+            {
+                Console.WriteLine($"Dropping legacy backfill index: {name}");
+                await _backfillCollection.Indexes.DropOneAsync(name);
+            }
+        }
+
+        var bfKeys = Builders<BsonDocument>.IndexKeys
+            .Ascending("indexer_id")
+            .Ascending("room_id");
         var bfOptions = new CreateIndexOptions { Unique = true };
         await _backfillCollection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(bfKeys, bfOptions));
 
-        // Helpful query index
-        var bfQueryKeys = Builders<BsonDocument>.IndexKeys.Ascending("done").Ascending("updated_at");
+        // Helpful query index for each account's queue scanning
+        var bfQueryKeys = Builders<BsonDocument>.IndexKeys
+            .Ascending("indexer_id")
+            .Ascending("done")
+            .Ascending("updated_at");
         await _backfillCollection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(bfQueryKeys));
     }
 
@@ -199,12 +225,13 @@ public class Program
     {
         if (_backfillCollection == null) return;
 
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
+        var filter = BackfillRoomFilter(roomId);
         var existing = await _backfillCollection.Find(filter).FirstOrDefaultAsync();
         if (existing != null) return;
 
         var doc = new BsonDocument
         {
+            { "indexer_id", _indexerId },
             { "room_id", roomId },
             { "cursor", cursor },
             { "done", false },
@@ -264,8 +291,8 @@ public class Program
             var roomId = r?.ToString();
             if (string.IsNullOrEmpty(roomId)) continue;
 
-            // Already seeded?
-            var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
+            // Already seeded for this indexer account?
+            var filter = BackfillRoomFilter(roomId);
             var existing = await _backfillCollection.Find(filter).FirstOrDefaultAsync();
             if (existing != null) continue;
 
@@ -396,6 +423,7 @@ public class Program
         if (_backfillCollection == null) return null;
 
         var filter = Builders<BsonDocument>.Filter.And(
+            Builders<BsonDocument>.Filter.Eq("indexer_id", _indexerId),
             Builders<BsonDocument>.Filter.Eq("done", false),
             Builders<BsonDocument>.Filter.Ne("claimed", true)
         );
@@ -416,7 +444,7 @@ public class Program
     private static async Task UnclaimRoom(string roomId)
     {
         if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
+        var filter = BackfillRoomFilter(roomId);
         var update = Builders<BsonDocument>.Update
             .Set("claimed", false)
             .Set("updated_at", DateTime.UtcNow);
@@ -426,7 +454,7 @@ public class Program
     private static async Task UpdateBackfillCursor(string roomId, string cursor)
     {
         if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
+        var filter = BackfillRoomFilter(roomId);
         var update = Builders<BsonDocument>.Update
             .Set("cursor", cursor)
             .Set("claimed", false)
@@ -437,7 +465,7 @@ public class Program
     private static async Task MarkBackfillDone(string roomId)
     {
         if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
+        var filter = BackfillRoomFilter(roomId);
         var update = Builders<BsonDocument>.Update
             .Set("done", true)
             .Set("claimed", false)
@@ -449,7 +477,7 @@ public class Program
     private static async Task IncrementBackfillError(string roomId, string reason)
     {
         if (_backfillCollection == null) return;
-        var filter = Builders<BsonDocument>.Filter.Eq("room_id", roomId);
+        var filter = BackfillRoomFilter(roomId);
         var update = Builders<BsonDocument>.Update
             .Inc("error_count", 1)
             .Set("last_error", reason)
@@ -457,6 +485,14 @@ public class Program
             .Set("claimed", false);
         await _backfillCollection.UpdateOneAsync(filter, update);
         Console.WriteLine($"Backfill error for room {roomId}: {reason}");
+    }
+
+    private static FilterDefinition<BsonDocument> BackfillRoomFilter(string roomId)
+    {
+        return Builders<BsonDocument>.Filter.And(
+            Builders<BsonDocument>.Filter.Eq("indexer_id", _indexerId),
+            Builders<BsonDocument>.Filter.Eq("room_id", roomId)
+        );
     }
 
     private static async Task ProcessEvents(string roomId, JsonArray events)
