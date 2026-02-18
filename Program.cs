@@ -525,8 +525,7 @@ public class Program
         {
             try
             {
-                var filter = Builders<BsonDocument>.Filter.Eq("event_id", doc["event_id"]);
-                await _eventsCollection.ReplaceOneAsync(filter, doc, new ReplaceOptions { IsUpsert = true });
+                await UpsertEventPreservingContent(doc);
             }
             catch
             {
@@ -535,6 +534,62 @@ public class Program
         }
 
         Console.WriteLine($"Processed {docs.Count} events from {roomId}");
+    }
+
+    private static async Task UpsertEventPreservingContent(BsonDocument incoming)
+    {
+        if (_eventsCollection == null) return;
+
+        var eventId = incoming.GetValue("event_id", BsonNull.Value)?.ToString();
+        if (string.IsNullOrEmpty(eventId) || eventId == "BsonNull") return;
+
+        var filter = Builders<BsonDocument>.Filter.Eq("event_id", eventId);
+        var existing = await _eventsCollection.Find(filter).FirstOrDefaultAsync();
+
+        // If this is a redacted copy of a message event, preserve original searchable body/content.
+        if (IsRedactedMessage(incoming) && existing != null)
+        {
+            if (existing.TryGetValue("content", out var existingContent)
+                && existingContent.IsBsonDocument
+                && (!incoming.TryGetValue("content", out var incomingContent)
+                    || !incomingContent.IsBsonDocument
+                    || incomingContent.AsBsonDocument.ElementCount == 0
+                    || !incomingContent.AsBsonDocument.Contains("body")))
+            {
+                incoming["content"] = existingContent.DeepClone().AsBsonDocument;
+                incoming["retained_redacted_content"] = true;
+            }
+
+            incoming["is_redacted"] = true;
+            incoming["redacted_at"] = DateTime.UtcNow;
+        }
+
+        // If this is a redaction event, annotate its target message without erasing content.
+        if (incoming.GetValue("type", "").ToString() == "m.room.redaction"
+            && incoming.TryGetValue("redacts", out var redacts)
+            && redacts.IsString)
+        {
+            var targetId = redacts.AsString;
+            if (!string.IsNullOrWhiteSpace(targetId))
+            {
+                var targetFilter = Builders<BsonDocument>.Filter.Eq("event_id", targetId);
+                var targetUpdate = Builders<BsonDocument>.Update
+                    .Set("is_redacted", true)
+                    .Set("redacted_by_event_id", eventId)
+                    .Set("redacted_by_sender", incoming.GetValue("sender", BsonNull.Value).ToString())
+                    .Set("redacted_at", DateTime.UtcNow);
+                await _eventsCollection.UpdateOneAsync(targetFilter, targetUpdate);
+            }
+        }
+
+        await _eventsCollection.ReplaceOneAsync(filter, incoming, new ReplaceOptions { IsUpsert = true });
+    }
+
+    private static bool IsRedactedMessage(BsonDocument doc)
+    {
+        if (doc.GetValue("type", "").ToString() != "m.room.message") return false;
+        if (!doc.TryGetValue("unsigned", out var unsigned) || !unsigned.IsBsonDocument) return false;
+        return unsigned.AsBsonDocument.Contains("redacted_because");
     }
 
     private static async Task AtomicWriteAsync(string path, string content)
