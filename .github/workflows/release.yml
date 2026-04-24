@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish (linux-x64 single-file)
+        run: |
+          dotnet restore
+          dotnet publish -c Release -r linux-x64 -o out \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false
+          chmod +x out/matrix-indexer
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum matrix-indexer > matrix-indexer-linux-x64.sha256
+          tar -czf matrix-indexer-linux-x64.tar.gz matrix-indexer matrix-indexer-linux-x64.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/matrix-indexer-linux-x64.tar.gz
+            out/matrix-indexer-linux-x64.sha256
+          generate_release_notes: true

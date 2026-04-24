@@ -2,15 +2,15 @@
 
 A .NET console app that indexes Matrix messages to MongoDB for search and retrieval.
 
-## Install indexer service
+## One-line install (Linux)
+
+Installs the **latest GitHub Release** (`matrix-indexer`) to `/usr/local/bin`, writes `/etc/matrix-indexer/indexer.env`, and installs `matrix-indexer.service`. If Docker is available, the installer also manages MongoDB with `matrix-indexer-mongo.service`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/slimelab-ai/matrix-indexer-dotnet/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/patrick-slimelab/matrix-indexer.NET/master/install.sh | sudo bash
 ```
 
-The installer downloads the latest release, verifies the checksum, installs `matrix-indexer`, writes `/etc/matrix-indexer/indexer.env`, and installs systemd units. If Docker is available, it also supervises a dedicated MongoDB container with `matrix-indexer-mongo.service` so Mongo survives reboots/restarts cleanly.
-
-Set these before running for non-interactive installs:
+### Non-interactive install
 
 ```bash
 sudo env MATRIX_HOMESERVER="https://matrix.example.org" \
@@ -18,6 +18,20 @@ sudo env MATRIX_HOMESERVER="https://matrix.example.org" \
   MATRIX_PASSWORD="..." \
   bash install.sh
 ```
+
+### OpenClaw/Clawdbot auto-config
+
+If the installer detects an OpenClaw or Clawdbot config in a standard state dir, it will best-effort read Matrix settings and write `/etc/matrix-indexer/indexer.env` (mode `0600`) without printing secrets. You can also pass an explicit config path:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/patrick-slimelab/matrix-indexer.NET/master/install.sh | sudo env OPENCLAW_CONFIG_PATH=/path/to/openclaw.json bash
+```
+
+## Releases
+
+Releases include:
+- `matrix-indexer-linux-x64.tar.gz`
+- `matrix-indexer-linux-x64.sha256`
 
 ## OpenClaw Skill
 

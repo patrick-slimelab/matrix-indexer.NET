@@ -12,7 +12,7 @@ set -euo pipefail
 # - Optionally provisions MongoDB via Docker + systemd
 # - Installs/enables matrix-indexer.service
 
-REPO="${REPO:-slimelab-ai/matrix-indexer-dotnet}"
+REPO="${REPO:-patrick-slimelab/matrix-indexer.NET}"
 VERSION="${VERSION:-latest}" # latest or vX.Y.Z
 PREFIX="${PREFIX:-/usr/local/bin}"
 
