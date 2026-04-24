@@ -2,6 +2,23 @@
 
 A .NET console app that indexes Matrix messages to MongoDB for search and retrieval.
 
+## Install indexer service
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/slimelab-ai/matrix-indexer-dotnet/main/install.sh | sudo bash
+```
+
+The installer downloads the latest release, verifies the checksum, installs `matrix-indexer`, writes `/etc/matrix-indexer/indexer.env`, and installs systemd units. If Docker is available, it also supervises a dedicated MongoDB container with `matrix-indexer-mongo.service` so Mongo survives reboots/restarts cleanly.
+
+Set these before running for non-interactive installs:
+
+```bash
+sudo env MATRIX_HOMESERVER="https://matrix.example.org" \
+  MATRIX_USER_ID="@bot:example.org" \
+  MATRIX_PASSWORD="..." \
+  bash install.sh
+```
+
 ## OpenClaw Skill
 
 This repo includes an OpenClaw skill for searching indexed Matrix messages.
@@ -39,5 +56,5 @@ matrix-indexer-search "query" --limit 20 --room "!roomId:server"
 
 ## Requirements
 
-- MongoDB instance with `matrix_index` database
-- `matrix-indexer-search` CLI tool installed on the target machine
+- MongoDB instance with `matrix_index` database, or Docker for installer-managed MongoDB
+- `matrix-indexer-search` CLI tool installed on the target machine for the OpenClaw search skill
