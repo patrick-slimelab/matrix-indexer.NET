@@ -6,7 +6,8 @@ set -euo pipefail
 # Examples:
 #   matrix-indexer-search "keyword" --limit 20
 #   matrix-indexer-search "deploy" --room '!room:example.org' --from 2026-04-01
-#   matrix-indexer-search "https?://" --sender '@user:example.org' --limit 50
+#   matrix-indexer-search ".*" --oldest --limit 5
+#   matrix-indexer-search --stats
 #
 # Env (optional):
 #   MONGODB_URI=mongodb://127.0.0.1:27017
@@ -15,11 +16,21 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: matrix-indexer-search <regex> [--limit N] [--room ROOM_ID] [--sender MXID] [--from TIME] [--to TIME] [--case-sensitive] [--include-redacted]
+Usage:
+  matrix-indexer-search <regex> [--limit N] [--room ROOM_ID] [--sender MXID] [--from TIME] [--to TIME] [--oldest|--newest] [--case-sensitive] [--include-redacted]
+  matrix-indexer-search --stats
 
 Searches the matrix-indexer MongoDB for m.room.message events whose content.body matches <regex>.
 
+Defaults:
+  Search results are newest-first. Use --oldest when checking the earliest indexed message.
+
 TIME may be ISO-8601/date text parseable by JavaScript Date.parse, or unix epoch milliseconds.
+
+Examples:
+  matrix-indexer-search "error" --limit 20
+  matrix-indexer-search ".*" --oldest --limit 1
+  matrix-indexer-search --stats
 
 Env (optional):
   MONGODB_URI=mongodb://127.0.0.1:27017
@@ -28,12 +39,18 @@ Env (optional):
 EOF
 }
 
+MODE="search"
 QUERY="${1:-}"
-if [[ "$QUERY" == "-h" || "$QUERY" == "--help" || -z "$QUERY" ]]; then
+if [[ "$QUERY" == "--stats" ]]; then
+  MODE="stats"
+  QUERY=""
+  shift || true
+elif [[ "$QUERY" == "-h" || "$QUERY" == "--help" || -z "$QUERY" ]]; then
   usage
   exit 0
+else
+  shift || true
 fi
-shift || true
 
 LIMIT=20
 ROOM=""
@@ -42,9 +59,12 @@ FROM_TIME=""
 TO_TIME=""
 CASE_INSENSITIVE=1
 INCLUDE_REDACTED=0
+SORT_DIR=-1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --stats)
+      MODE="stats"; shift;;
     --limit)
       LIMIT="${2:-}"; shift 2;;
     --room)
@@ -55,6 +75,10 @@ while [[ $# -gt 0 ]]; do
       FROM_TIME="${2:-}"; shift 2;;
     --to)
       TO_TIME="${2:-}"; shift 2;;
+    --oldest|--asc|--ascending)
+      SORT_DIR=1; shift;;
+    --newest|--desc|--descending)
+      SORT_DIR=-1; shift;;
     --case-sensitive)
       CASE_INSENSITIVE=0; shift;;
     --include-redacted)
@@ -70,6 +94,12 @@ done
 
 if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --limit must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ "$MODE" == "search" && -z "$QUERY" ]]; then
+  echo "ERROR: missing search regex (or use --stats)" >&2
+  usage >&2
   exit 2
 fi
 
@@ -92,20 +122,56 @@ PY
   fi
 }
 
-QUERY_JSON="$(json_string "$QUERY")"
-ROOM_JSON="$(json_string "$ROOM")"
-SENDER_JSON="$(json_string "$SENDER")"
-FROM_JSON="$(json_string "$FROM_TIME")"
-TO_JSON="$(json_string "$TO_TIME")"
 DB_JSON="$(json_string "$MONGODB_DB")"
 
-OPTS="i"
-if [[ "$CASE_INSENSITIVE" == "0" ]]; then
-  OPTS=""
-fi
-OPTS_JSON="$(json_string "$OPTS")"
+if [[ "$MODE" == "stats" ]]; then
+  JS="const dbname=${DB_JSON};
+const d = db.getSiblingDB(dbname);
+const events = d.getCollection('events');
+const bf = d.getCollection('room_backfill');
+function asMs(x) { return typeof x === 'number' ? x : (x && x.toNumber ? x.toNumber() : Number(x)); }
+function iso(x) {
+  const n = asMs(x);
+  return Number.isFinite(n) ? new Date(n).toISOString() : '';
+}
+function one(cursor) {
+  const arr = cursor.limit(1).toArray();
+  if (!arr.length) return null;
+  const x = arr[0];
+  return { iso: iso(x.origin_server_ts), room_id: x.room_id || '', sender: x.sender || '', event_id: x.event_id || '', body: (x.content && x.content.body ? String(x.content.body).replace(/\n/g, ' ').slice(0, 160) : '') };
+}
+const oldest = one(events.find({ type: 'm.room.message', origin_server_ts: { \$exists: true } }, { origin_server_ts: 1, room_id: 1, sender: 1, event_id: 1, 'content.body': 1 }).sort({ origin_server_ts: 1 }));
+const newest = one(events.find({ type: 'm.room.message', origin_server_ts: { \$exists: true } }, { origin_server_ts: 1, room_id: 1, sender: 1, event_id: 1, 'content.body': 1 }).sort({ origin_server_ts: -1 }));
+const yearCounts = events.aggregate([
+  { \$match: { type: 'm.room.message', origin_server_ts: { \$type: 'number' } } },
+  { \$project: { year: { \$year: { \$toDate: '\$origin_server_ts' } } } },
+  { \$group: { _id: '\$year', count: { \$sum: 1 } } },
+  { \$sort: { _id: 1 } }
+]).toArray();
+print('db\t' + dbname);
+print('events\t' + events.countDocuments({}));
+print('messages\t' + events.countDocuments({ type: 'm.room.message' }));
+print('oldest_message\t' + (oldest ? [oldest.iso, oldest.room_id, oldest.sender, oldest.event_id, oldest.body].join('\t') : ''));
+print('newest_message\t' + (newest ? [newest.iso, newest.room_id, newest.sender, newest.event_id, newest.body].join('\t') : ''));
+print('backfill_rooms_total\t' + bf.countDocuments({}));
+print('backfill_rooms_done\t' + bf.countDocuments({ done: true }));
+print('backfill_rooms_remaining\t' + bf.countDocuments({ done: { \$ne: true } }));
+print('backfill_rooms_errored\t' + bf.countDocuments({ error_count: { \$gt: 0 }, done: { \$ne: true } }));
+print('messages_by_year\t' + yearCounts.map(x => x._id + ':' + x.count).join(','));"
+else
+  QUERY_JSON="$(json_string "$QUERY")"
+  ROOM_JSON="$(json_string "$ROOM")"
+  SENDER_JSON="$(json_string "$SENDER")"
+  FROM_JSON="$(json_string "$FROM_TIME")"
+  TO_JSON="$(json_string "$TO_TIME")"
 
-JS="const dbname=${DB_JSON};
+  OPTS="i"
+  if [[ "$CASE_INSENSITIVE" == "0" ]]; then
+    OPTS=""
+  fi
+  OPTS_JSON="$(json_string "$OPTS")"
+
+  JS="const dbname=${DB_JSON};
 const query=${QUERY_JSON};
 const room=${ROOM_JSON};
 const sender=${SENDER_JSON};
@@ -114,12 +180,18 @@ const toText=${TO_JSON};
 const opts=${OPTS_JSON};
 const includeRedacted=${INCLUDE_REDACTED} === 1;
 const limit=${LIMIT};
+const sortDir=${SORT_DIR};
 function parseTime(v) {
   if (!v) return null;
   if (/^[0-9]+$/.test(v)) return Number(v);
   const ms = Date.parse(v);
   if (Number.isNaN(ms)) throw new Error('Could not parse time: ' + v);
   return ms;
+}
+function asMs(x) { return typeof x === 'number' ? x : (x && x.toNumber ? x.toNumber() : Number(x)); }
+function iso(x) {
+  const n = asMs(x);
+  return Number.isFinite(n) ? new Date(n).toISOString() : '';
 }
 const filter = {
   type: 'm.room.message',
@@ -144,13 +216,14 @@ col.find(filter, {
   'content.body': 1,
   is_redacted: 1,
 })
-  .sort({ origin_server_ts: -1 })
+  .sort({ origin_server_ts: sortDir })
   .limit(limit)
   .forEach(d => {
-    const ts = d.origin_server_ts ? new Date(d.origin_server_ts).toISOString() : '';
+    const ts = d.origin_server_ts ? iso(d.origin_server_ts) : '';
     const body = d.content && d.content.body ? String(d.content.body).replace(/\n/g, ' ') : '';
     print([ts, d.room_id || '', d.sender || '', d.event_id || '', body].join('\t'));
   });"
+fi
 
 docker_cmd() {
   if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
