@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Search matrix-indexer MongoDB for message content.
+#
+# Examples:
+#   matrix-indexer-search "keyword" --limit 20
+#   matrix-indexer-search "deploy" --room '!room:example.org' --from 2026-04-01
+#   matrix-indexer-search "https?://" --sender '@user:example.org' --limit 50
+#
+# Env (optional):
+#   MONGODB_URI=mongodb://127.0.0.1:27017
+#   MONGODB_DB=matrix_index
+#   MONGO_CONTAINER_NAME=matrix-indexer-mongo
+
+usage() {
+  cat <<'EOF'
+Usage: matrix-indexer-search <regex> [--limit N] [--room ROOM_ID] [--sender MXID] [--from TIME] [--to TIME] [--case-sensitive] [--include-redacted]
+
+Searches the matrix-indexer MongoDB for m.room.message events whose content.body matches <regex>.
+
+TIME may be ISO-8601/date text parseable by JavaScript Date.parse, or unix epoch milliseconds.
+
+Env (optional):
+  MONGODB_URI=mongodb://127.0.0.1:27017
+  MONGODB_DB=matrix_index
+  MONGO_CONTAINER_NAME=matrix-indexer-mongo
+EOF
+}
+
+QUERY="${1:-}"
+if [[ "$QUERY" == "-h" || "$QUERY" == "--help" || -z "$QUERY" ]]; then
+  usage
+  exit 0
+fi
+shift || true
+
+LIMIT=20
+ROOM=""
+SENDER=""
+FROM_TIME=""
+TO_TIME=""
+CASE_INSENSITIVE=1
+INCLUDE_REDACTED=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --limit)
+      LIMIT="${2:-}"; shift 2;;
+    --room)
+      ROOM="${2:-}"; shift 2;;
+    --sender)
+      SENDER="${2:-}"; shift 2;;
+    --from)
+      FROM_TIME="${2:-}"; shift 2;;
+    --to)
+      TO_TIME="${2:-}"; shift 2;;
+    --case-sensitive)
+      CASE_INSENSITIVE=0; shift;;
+    --include-redacted)
+      INCLUDE_REDACTED=1; shift;;
+    -h|--help)
+      usage; exit 0;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage >&2
+      exit 2;;
+  esac
+done
+
+if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --limit must be a positive integer" >&2
+  exit 2
+fi
+
+MONGODB_URI="${MONGODB_URI:-mongodb://127.0.0.1:27017}"
+MONGODB_DB="${MONGODB_DB:-matrix_index}"
+MONGO_CONTAINER_NAME="${MONGO_CONTAINER_NAME:-matrix-indexer-mongo}"
+
+json_string() {
+  local value="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    VALUE="$value" python3 - <<'PY'
+import json, os
+print(json.dumps(os.environ.get('VALUE', '')))
+PY
+  elif command -v node >/dev/null 2>&1; then
+    VALUE="$value" node -e 'process.stdout.write(JSON.stringify(process.env.VALUE || "") + "\n")'
+  else
+    # Minimal fallback: enough for typical Matrix IDs/search text.
+    printf '"%s"' "$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  fi
+}
+
+QUERY_JSON="$(json_string "$QUERY")"
+ROOM_JSON="$(json_string "$ROOM")"
+SENDER_JSON="$(json_string "$SENDER")"
+FROM_JSON="$(json_string "$FROM_TIME")"
+TO_JSON="$(json_string "$TO_TIME")"
+DB_JSON="$(json_string "$MONGODB_DB")"
+
+OPTS="i"
+if [[ "$CASE_INSENSITIVE" == "0" ]]; then
+  OPTS=""
+fi
+OPTS_JSON="$(json_string "$OPTS")"
+
+JS="const dbname=${DB_JSON};
+const query=${QUERY_JSON};
+const room=${ROOM_JSON};
+const sender=${SENDER_JSON};
+const fromText=${FROM_JSON};
+const toText=${TO_JSON};
+const opts=${OPTS_JSON};
+const includeRedacted=${INCLUDE_REDACTED} === 1;
+const limit=${LIMIT};
+function parseTime(v) {
+  if (!v) return null;
+  if (/^[0-9]+$/.test(v)) return Number(v);
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) throw new Error('Could not parse time: ' + v);
+  return ms;
+}
+const filter = {
+  type: 'm.room.message',
+  'content.body': { \$regex: query, \$options: opts }
+};
+if (!includeRedacted) filter.is_redacted = { \$ne: true };
+if (room) filter.room_id = room;
+if (sender) filter.sender = sender;
+const fromMs = parseTime(fromText);
+const toMs = parseTime(toText);
+if (fromMs !== null || toMs !== null) {
+  filter.origin_server_ts = {};
+  if (fromMs !== null) filter.origin_server_ts.\$gte = fromMs;
+  if (toMs !== null) filter.origin_server_ts.\$lte = toMs;
+}
+const col = db.getSiblingDB(dbname).getCollection('events');
+col.find(filter, {
+  event_id: 1,
+  room_id: 1,
+  sender: 1,
+  origin_server_ts: 1,
+  'content.body': 1,
+  is_redacted: 1,
+})
+  .sort({ origin_server_ts: -1 })
+  .limit(limit)
+  .forEach(d => {
+    const ts = d.origin_server_ts ? new Date(d.origin_server_ts).toISOString() : '';
+    const body = d.content && d.content.body ? String(d.content.body).replace(/\n/g, ' ') : '';
+    print([ts, d.room_id || '', d.sender || '', d.event_id || '', body].join('\t'));
+  });"
+
+docker_cmd() {
+  if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+    echo "docker"
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n docker ps >/dev/null 2>&1; then
+    echo "sudo -n docker"
+    return
+  fi
+  echo ""
+}
+
+run_mongosh() {
+  if command -v mongosh >/dev/null 2>&1; then
+    mongosh "$MONGODB_URI" --quiet --eval "$JS"
+    return
+  fi
+
+  local dcmd
+  dcmd="$(docker_cmd)"
+  if [[ -n "$dcmd" ]]; then
+    if $dcmd ps --format '{{.Names}}' | grep -qx "$MONGO_CONTAINER_NAME"; then
+      $dcmd exec -i "$MONGO_CONTAINER_NAME" mongosh "$MONGODB_URI" --quiet --eval "$JS"
+      return
+    fi
+  fi
+
+  echo "ERROR: mongosh not found and mongo container '$MONGO_CONTAINER_NAME' not accessible." >&2
+  echo "Install mongosh, run with sudo, or set MONGO_CONTAINER_NAME to the running container." >&2
+  exit 1
+}
+
+run_mongosh

@@ -4,7 +4,7 @@ A .NET console app that indexes Matrix messages to MongoDB for search and retrie
 
 ## One-line install (Linux)
 
-Installs the **latest GitHub Release** (`matrix-indexer`) to `/usr/local/bin`, writes `/etc/matrix-indexer/indexer.env`, and installs `matrix-indexer.service`. If Docker is available, the installer also manages MongoDB with `matrix-indexer-mongo.service`.
+Installs the **latest GitHub Release** (`matrix-indexer` and `matrix-indexer-search`) to `/usr/local/bin`, writes `/etc/matrix-indexer/indexer.env`, and installs `matrix-indexer.service`. If Docker is available, the installer also manages MongoDB with `matrix-indexer-mongo.service`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/patrick-slimelab/matrix-indexer.NET/master/install.sh | sudo bash
@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/patrick-slimelab/matrix-indexer.NET
 ## Releases
 
 Releases include:
-- `matrix-indexer-linux-x64.tar.gz`
+- `matrix-indexer-linux-x64.tar.gz` (`matrix-indexer`, `matrix-indexer-search`, checksums)
 - `matrix-indexer-linux-x64.sha256`
 
 ## OpenClaw Skill

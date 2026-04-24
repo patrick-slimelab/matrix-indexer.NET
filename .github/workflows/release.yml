@@ -29,13 +29,15 @@ jobs:
             -p:PublishSingleFile=true \
             -p:PublishTrimmed=false
           chmod +x out/matrix-indexer
+          cp -v ./matrix-indexer-search out/matrix-indexer-search
+          chmod +x out/matrix-indexer-search
 
       - name: Package
         run: |
           set -euo pipefail
           cd out
-          sha256sum matrix-indexer > matrix-indexer-linux-x64.sha256
-          tar -czf matrix-indexer-linux-x64.tar.gz matrix-indexer matrix-indexer-linux-x64.sha256
+          sha256sum matrix-indexer matrix-indexer-search > matrix-indexer-linux-x64.sha256
+          tar -czf matrix-indexer-linux-x64.tar.gz matrix-indexer matrix-indexer-search matrix-indexer-linux-x64.sha256
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

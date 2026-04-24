@@ -46,6 +46,33 @@ need curl
 need tar
 need sha256sum
 
+install_mongosh_if_possible() {
+  if command -v mongosh >/dev/null 2>&1; then return 0; fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[install] mongosh not found; attempting apt-get install mongosh" >&2
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
+    apt-get install -y mongodb-mongosh >/dev/null 2>&1 && command -v mongosh >/dev/null 2>&1 && return 0
+  fi
+
+  local ver="2.3.8"
+  local arch="linux-x64"
+  local url="https://downloads.mongodb.com/compass/mongosh-${ver}-${arch}.tgz"
+  echo "[install] Installing mongosh from tarball: $url" >&2
+  local tmp
+  tmp="$(mktemp -d)"
+  (
+    cd "$tmp"
+    curl -fsSL -o mongosh.tgz "$url"
+    tar -xzf mongosh.tgz
+    install -m 0755 mongosh-*/bin/mongosh /usr/local/bin/mongosh
+  )
+  rm -rf "$tmp"
+
+  command -v mongosh >/dev/null 2>&1
+}
+
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "ERROR: run as root (use: curl ... | sudo bash)" >&2
   exit 1
@@ -91,6 +118,8 @@ echo "[install] Downloading ${ASSET_TGZ} (${TAG})"
 curl -fsSL -o "$TMP/$ASSET_TGZ" "$BASE_URL/$ASSET_TGZ"
 curl -fsSL -o "$TMP/$ASSET_SHA" "$BASE_URL/$ASSET_SHA"
 
+install_mongosh_if_possible || echo "[install] NOTE: failed to install mongosh automatically" >&2
+
 cd "$TMP"
 
 echo "[install] Extracting"
@@ -101,13 +130,7 @@ sha256sum -c "$ASSET_SHA"
 
 install -d "$PREFIX"
 install -m 0755 "$TMP/matrix-indexer" "$PREFIX/matrix-indexer"
-
-# Install optional helper CLIs if the release asset contains them.
-for helper in matrix-indexer-search matrix-indexer-delta; do
-  if [[ -f "$TMP/$helper" ]]; then
-    install -m 0755 "$TMP/$helper" "$PREFIX/$helper"
-  fi
-done
+install -m 0755 "$TMP/matrix-indexer-search" "$PREFIX/matrix-indexer-search"
 
 echo "[install] Installed binaries to $PREFIX"
 
