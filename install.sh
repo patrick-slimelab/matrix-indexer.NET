@@ -355,7 +355,7 @@ EnvironmentFile=${ENV_FILE}
 WorkingDirectory=${STATE_DIR}
 # Run preflight commands as root (+ prefix) so secret env files can stay 0600 root-readable only.
 ExecStartPre=+/bin/sh -lc 'mkdir -p ${LOG_DIR} && touch ${LOG_DIR}/matrix-indexer.log && chown ${SVC_USER}:${SVC_GROUP} ${LOG_DIR}/matrix-indexer.log && chmod 0644 ${LOG_DIR}/matrix-indexer.log'
-ExecStartPre=+/bin/bash -lc 'set -a; source ${ENV_FILE}; set +a; case "\${MONGODB_URI}" in mongodb://127.0.0.1:*|mongodb://localhost:*) ;; *) exit 0 ;; esac; port="\${MONGODB_URI##*:}"; port="\${port%%/*}"; for i in {1..90}; do (echo >/dev/tcp/127.0.0.1/\${port}) >/dev/null 2>&1 && exit 0; sleep 0.5; done; echo "Mongo not ready" >&2; exit 1'
+ExecStartPre=+/bin/bash -lc 'for i in {1..90}; do (echo >/dev/tcp/127.0.0.1/${MONGO_PORT}) >/dev/null 2>&1 && exit 0; sleep 0.5; done; echo "Mongo not ready on 127.0.0.1:${MONGO_PORT}" >&2; exit 1'
 ExecStart=${PREFIX}/matrix-indexer
 Restart=always
 RestartSec=2
