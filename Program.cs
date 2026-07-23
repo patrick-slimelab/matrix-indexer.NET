@@ -19,6 +19,7 @@ public class Program
     // Backfill behavior
     private static int _backfillPageSize = 200;
     private static int _backfillWorkers = 2;
+    private static int _claimLeaseMinutes = 15;
 
     // Room discovery behavior
     private static int _joinedRoomsPollSeconds = 300;
@@ -38,6 +39,7 @@ public class Program
         _stateFile = GetEnv("INDEXER_SYNC_TOKEN_PATH", _stateFile);
         _backfillPageSize = int.Parse(GetEnv("INDEXER_BACKFILL_PAGE_SIZE", _backfillPageSize.ToString()));
         _backfillWorkers = int.Parse(GetEnv("INDEXER_BACKFILL_WORKERS", _backfillWorkers.ToString()));
+        _claimLeaseMinutes = int.Parse(GetEnv("INDEXER_CLAIM_LEASE_MINUTES", _claimLeaseMinutes.ToString()));
         _joinedRoomsPollSeconds = int.Parse(GetEnv("INDEXER_JOINED_ROOMS_POLL_SECONDS", _joinedRoomsPollSeconds.ToString()));
 
         // 2. Mongo
@@ -94,7 +96,7 @@ public class Program
         // Aggressively discover joined rooms (so we seed backfill even for quiet rooms)
         try
         {
-            await DiscoverJoinedRoomsAndSeedBackfill(homeserver);
+            await DiscoverJoinedRoomsAndSeedBackfill(homeserver, reconcileExisting: true);
         }
         catch (Exception ex)
         {
@@ -266,7 +268,7 @@ public class Program
         {
             try
             {
-                await DiscoverJoinedRoomsAndSeedBackfill(homeserver);
+                await DiscoverJoinedRoomsAndSeedBackfill(homeserver, reconcileExisting: false);
             }
             catch (Exception ex)
             {
@@ -277,7 +279,7 @@ public class Program
         }
     }
 
-    private static async Task DiscoverJoinedRoomsAndSeedBackfill(string homeserver)
+    private static async Task DiscoverJoinedRoomsAndSeedBackfill(string homeserver, bool reconcileExisting)
     {
         if (_backfillCollection == null) return;
 
@@ -301,7 +303,12 @@ public class Program
             // Already seeded for this indexer account?
             var filter = BackfillRoomFilter(roomId);
             var existing = await _backfillCollection.Find(filter).FirstOrDefaultAsync();
-            if (existing != null) continue;
+            if (existing != null)
+            {
+                if (reconcileExisting)
+                    await SeedReconciliation(homeserver, roomId, existing);
+                continue;
+            }
 
             // Get an initial pagination token by asking for 1 event backward from "now".
             var cursor = await GetInitialBackfillCursorFromMessages(homeserver, roomId);
@@ -319,6 +326,33 @@ public class Program
 
         if (seeded > 0)
             Console.WriteLine($"joined_rooms discovery: seeded {seeded} room(s) for backfill");
+    }
+
+    private static async Task SeedReconciliation(string homeserver, string roomId, BsonDocument state)
+    {
+        if (_eventsCollection == null || _backfillCollection == null) return;
+        if (state.GetValue("reconcile_pending", false).ToBoolean()) return;
+
+        var latest = await _eventsCollection
+            .Find(Builders<BsonDocument>.Filter.Eq("room_id", roomId))
+            .Sort(Builders<BsonDocument>.Sort.Descending("origin_server_ts"))
+            .Limit(1)
+            .FirstOrDefaultAsync();
+        if (latest == null || !latest.TryGetValue("origin_server_ts", out var tsValue) || !tsValue.IsNumeric) return;
+
+        var cursor = await GetInitialBackfillCursorFromMessages(homeserver, roomId);
+        if (string.IsNullOrEmpty(cursor)) return;
+
+        var targetTs = state.GetValue("reconcile_target_ts", tsValue).ToInt64();
+        var update = Builders<BsonDocument>.Update
+            .Set("reconcile_cursor", cursor)
+            .Set("reconcile_target_ts", targetTs)
+            .Set("reconcile_pending", true)
+            .Set("reconcile_seeded_at", DateTime.UtcNow)
+            .Set("claimed", false)
+            .Set("updated_at", DateTime.UtcNow);
+        await _backfillCollection.UpdateOneAsync(BackfillRoomFilter(roomId), update);
+        Console.WriteLine($"Seeded outage reconciliation for room {roomId} to overlap ts={targetTs}");
     }
 
     private static async Task<string?> GetInitialBackfillCursorFromMessages(string homeserver, string roomId)
@@ -364,11 +398,14 @@ public class Program
                 }
 
                 var roomId = room["room_id"].AsString;
-                var cursor = room.GetValue("cursor", BsonNull.Value).ToString();
+                var reconciling = room.GetValue("reconcile_pending", false).ToBoolean();
+                var cursorField = reconciling ? "reconcile_cursor" : "cursor";
+                var cursor = room.GetValue(cursorField, BsonNull.Value).ToString();
 
                 if (string.IsNullOrEmpty(cursor) || cursor == "BsonNull")
                 {
-                    await MarkBackfillDone(roomId);
+                    if (reconciling) await MarkReconciliationDone(roomId);
+                    else await MarkBackfillDone(roomId);
                     continue;
                 }
 
@@ -401,18 +438,26 @@ public class Program
                 var chunk = json["chunk"]?.AsArray();
                 var end = json["end"]?.ToString();
 
+                var overlapFound = reconciling && chunk != null
+                    && await ReconciliationOverlapFound(room, chunk);
+
                 if (chunk != null && chunk.Count > 0)
                 {
                     await ProcessEvents(roomId, chunk);
                 }
 
-                if (string.IsNullOrEmpty(end) || chunk == null || chunk.Count == 0)
+                if (reconciling && overlapFound)
                 {
-                    await MarkBackfillDone(roomId);
+                    await MarkReconciliationDone(roomId);
+                }
+                else if (string.IsNullOrEmpty(end) || chunk == null || chunk.Count == 0)
+                {
+                    if (reconciling) await MarkReconciliationDone(roomId);
+                    else await MarkBackfillDone(roomId);
                 }
                 else
                 {
-                    await UpdateBackfillCursor(roomId, end);
+                    await UpdateBackfillCursor(roomId, end, cursorField);
                 }
 
                 await Task.Delay(250);
@@ -429,14 +474,23 @@ public class Program
     {
         if (_backfillCollection == null) return null;
 
+        var workPending = Builders<BsonDocument>.Filter.Or(
+            Builders<BsonDocument>.Filter.Eq("done", false),
+            Builders<BsonDocument>.Filter.Eq("reconcile_pending", true)
+        );
+        var leaseAvailable = Builders<BsonDocument>.Filter.Or(
+            Builders<BsonDocument>.Filter.Ne("claimed", true),
+            Builders<BsonDocument>.Filter.Lt("claimed_at", DateTime.UtcNow.AddMinutes(-_claimLeaseMinutes))
+        );
         var filter = Builders<BsonDocument>.Filter.And(
             Builders<BsonDocument>.Filter.Eq("indexer_id", _indexerId),
-            Builders<BsonDocument>.Filter.Eq("done", false),
-            Builders<BsonDocument>.Filter.Ne("claimed", true)
+            workPending,
+            leaseAvailable
         );
 
         var update = Builders<BsonDocument>.Update
             .Set("claimed", true)
+            .Set("claimed_at", DateTime.UtcNow)
             .Set("updated_at", DateTime.UtcNow);
 
         var opts = new FindOneAndUpdateOptions<BsonDocument>
@@ -454,17 +508,19 @@ public class Program
         var filter = BackfillRoomFilter(roomId);
         var update = Builders<BsonDocument>.Update
             .Set("claimed", false)
+            .Unset("claimed_at")
             .Set("updated_at", DateTime.UtcNow);
         await _backfillCollection.UpdateOneAsync(filter, update);
     }
 
-    private static async Task UpdateBackfillCursor(string roomId, string cursor)
+    private static async Task UpdateBackfillCursor(string roomId, string cursor, string cursorField)
     {
         if (_backfillCollection == null) return;
         var filter = BackfillRoomFilter(roomId);
         var update = Builders<BsonDocument>.Update
-            .Set("cursor", cursor)
+            .Set(cursorField, cursor)
             .Set("claimed", false)
+            .Unset("claimed_at")
             .Set("updated_at", DateTime.UtcNow);
         await _backfillCollection.UpdateOneAsync(filter, update);
     }
@@ -476,9 +532,42 @@ public class Program
         var update = Builders<BsonDocument>.Update
             .Set("done", true)
             .Set("claimed", false)
+            .Unset("claimed_at")
             .Set("updated_at", DateTime.UtcNow);
         await _backfillCollection.UpdateOneAsync(filter, update);
         Console.WriteLine($"Backfill complete for room {roomId}");
+    }
+
+    private static async Task MarkReconciliationDone(string roomId)
+    {
+        if (_backfillCollection == null) return;
+        var update = Builders<BsonDocument>.Update
+            .Set("reconcile_pending", false)
+            .Set("reconcile_completed_at", DateTime.UtcNow)
+            .Set("claimed", false)
+            .Unset("claimed_at")
+            .Unset("reconcile_cursor")
+            .Set("updated_at", DateTime.UtcNow);
+        await _backfillCollection.UpdateOneAsync(BackfillRoomFilter(roomId), update);
+        Console.WriteLine($"Outage reconciliation complete for room {roomId}");
+    }
+
+    private static async Task<bool> ReconciliationOverlapFound(BsonDocument room, JsonArray events)
+    {
+        if (_eventsCollection == null) return false;
+        var targetTs = room.GetValue("reconcile_target_ts", long.MinValue).ToInt64();
+        var candidateIds = events
+            .Where(e => e?["origin_server_ts"]?.GetValue<long>() <= targetTs)
+            .Select(e => e?["event_id"]?.ToString())
+            .Where(id => !string.IsNullOrEmpty(id))
+            .Cast<string>()
+            .ToList();
+        if (candidateIds.Count == 0) return false;
+
+        var existing = await _eventsCollection.CountDocumentsAsync(
+            Builders<BsonDocument>.Filter.In("event_id", candidateIds),
+            new CountOptions { Limit = 1 });
+        return existing > 0;
     }
 
     private static async Task IncrementBackfillError(string roomId, string reason)
@@ -489,7 +578,8 @@ public class Program
             .Inc("error_count", 1)
             .Set("last_error", reason)
             .Set("updated_at", DateTime.UtcNow)
-            .Set("claimed", false);
+            .Set("claimed", false)
+            .Unset("claimed_at");
         await _backfillCollection.UpdateOneAsync(filter, update);
         Console.WriteLine($"Backfill error for room {roomId}: {reason}");
     }
