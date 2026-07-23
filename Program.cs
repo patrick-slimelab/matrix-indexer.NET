@@ -547,6 +547,7 @@ public class Program
             .Set("claimed", false)
             .Unset("claimed_at")
             .Unset("reconcile_cursor")
+            .Unset("reconcile_target_ts")
             .Set("updated_at", DateTime.UtcNow);
         await _backfillCollection.UpdateOneAsync(BackfillRoomFilter(roomId), update);
         Console.WriteLine($"Outage reconciliation complete for room {roomId}");
