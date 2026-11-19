@@ -4,7 +4,7 @@ A .NET console app that indexes Matrix messages to MongoDB for search and retrie
 
 ## One-line install (Linux)
 
-Installs the **latest GitHub Release** (`matrix-indexer` and `matrix-indexer-search`) to `/usr/local/bin`, writes `/etc/matrix-indexer/indexer.env`, and installs `matrix-indexer.service`. If Docker is available, the installer also manages MongoDB with `matrix-indexer-mongo.service`.
+Installs the **latest GitHub Release** (`matrix-indexer` and `matrix-indexer-search`) to `/usr/local/bin`, writes `/etc/matrix-indexer/indexer.env`, and installs `matrix-indexer.service`. If MongoDB is already listening on the configured local port, the installer reuses it. Otherwise, when Docker is available, the installer manages MongoDB with `matrix-indexer-mongo.service`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/patrick-slimelab/matrix-indexer.NET/master/install.sh | sudo bash
@@ -72,3 +72,7 @@ matrix-indexer-search "query" --limit 20 --room "!roomId:server"
 
 - MongoDB instance with `matrix_index` database, or Docker for installer-managed MongoDB
 - `matrix-indexer-search` CLI tool installed on the target machine for the OpenClaw search skill
+
+## Matrix authentication
+
+The indexer performs password login only when no usable saved access token exists. It stores the resulting token at `INDEXER_ACCESS_TOKEN_PATH` (default: `/var/lib/matrix-indexer/access_token.txt`) with mode `0600`, validates it with `/_matrix/client/v3/account/whoami` on startup, and reuses it across restarts. All Matrix client calls use the stable `v3` API.

@@ -14,6 +14,7 @@ public class Program
 
     private static string? _syncToken;
     private static string _stateFile = "sync_token.txt";
+    private static string _accessTokenFile = "access_token.txt";
     private static string _indexerId = "default";
 
     // Backfill behavior
@@ -27,6 +28,7 @@ public class Program
     public static async Task Main(string[] args)
     {
         Console.WriteLine("Starting Matrix Indexer (.NET)");
+        Http.DefaultRequestHeaders.UserAgent.ParseAdd("matrix-indexer/1.0");
 
         // 1. Config
         var homeserver = GetEnv("MATRIX_HOMESERVER");
@@ -37,6 +39,7 @@ public class Program
 
         _indexerId = GetEnv("INDEXER_ID", userId);
         _stateFile = GetEnv("INDEXER_SYNC_TOKEN_PATH", _stateFile);
+        _accessTokenFile = GetEnv("INDEXER_ACCESS_TOKEN_PATH", _accessTokenFile);
         _backfillPageSize = int.Parse(GetEnv("INDEXER_BACKFILL_PAGE_SIZE", _backfillPageSize.ToString()));
         _backfillWorkers = int.Parse(GetEnv("INDEXER_BACKFILL_WORKERS", _backfillWorkers.ToString()));
         _claimLeaseMinutes = int.Parse(GetEnv("INDEXER_CLAIM_LEASE_MINUTES", _claimLeaseMinutes.ToString()));
@@ -57,30 +60,8 @@ public class Program
         if (!homeserver.StartsWith("http")) homeserver = "https://" + homeserver;
         homeserver = homeserver.TrimEnd('/');
 
-        Console.WriteLine($"Logging into Matrix: {homeserver} as {userId} (indexer_id={_indexerId})");
-
-        string accessToken;
-        try
-        {
-            var loginData = new
-            {
-                type = "m.login.password",
-                user = userId,
-                password = password
-            };
-
-            var loginResp = await Http.PostAsJsonAsync($"{homeserver}/_matrix/client/r0/login", loginData);
-            loginResp.EnsureSuccessStatusCode();
-
-            var loginJson = await loginResp.Content.ReadFromJsonAsync<JsonNode>();
-            accessToken = loginJson?["access_token"]?.ToString() ?? throw new Exception("No access token");
-            Console.WriteLine("Login successful.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Login failed: {ex.Message}");
-            return;
-        }
+        var accessToken = await ResolveAccessToken(homeserver, userId, password);
+        if (accessToken == null) return;
 
         // 4. Load state
         if (File.Exists(_stateFile))
@@ -110,7 +91,7 @@ public class Program
         {
             try
             {
-                var url = $"{homeserver}/_matrix/client/r0/sync?timeout=30000";
+                var url = $"{homeserver}/_matrix/client/v3/sync?timeout=30000";
                 if (!string.IsNullOrEmpty(_syncToken)) url += $"&since={_syncToken}";
 
                 var syncResp = await Http.GetAsync(url);
@@ -153,6 +134,57 @@ public class Program
                 Console.WriteLine($"Error in sync loop: {ex.Message}");
                 await Task.Delay(5000);
             }
+        }
+    }
+
+    private static async Task<string?> ResolveAccessToken(string homeserver, string userId, string password)
+    {
+        if (File.Exists(_accessTokenFile))
+        {
+            var savedToken = (await File.ReadAllTextAsync(_accessTokenFile)).Trim();
+            if (!string.IsNullOrEmpty(savedToken))
+            {
+                using var whoAmI = new HttpRequestMessage(HttpMethod.Get, $"{homeserver}/_matrix/client/v3/account/whoami");
+                whoAmI.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", savedToken);
+                var whoAmIResponse = await Http.SendAsync(whoAmI);
+                if (whoAmIResponse.IsSuccessStatusCode)
+                {
+                    Console.WriteLine("Loaded and verified saved Matrix access token.");
+                    return savedToken;
+                }
+
+                Console.WriteLine($"Saved Matrix access token was rejected ({whoAmIResponse.StatusCode}); logging in once to replace it.");
+            }
+        }
+
+        Console.WriteLine($"Logging into Matrix: {homeserver} as {userId} (indexer_id={_indexerId})");
+        try
+        {
+            var loginData = new
+            {
+                type = "m.login.password",
+                identifier = new { type = "m.id.user", user = userId },
+                password,
+                initial_device_display_name = "matrix-indexer"
+            };
+
+            var loginResp = await Http.PostAsJsonAsync($"{homeserver}/_matrix/client/v3/login", loginData);
+            loginResp.EnsureSuccessStatusCode();
+
+            var loginJson = await loginResp.Content.ReadFromJsonAsync<JsonNode>();
+            var accessToken = loginJson?["access_token"]?.ToString() ?? throw new Exception("No access token");
+            await AtomicWriteAsync(_accessTokenFile, accessToken);
+            if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() || OperatingSystem.IsFreeBSD())
+            {
+                File.SetUnixFileMode(_accessTokenFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            Console.WriteLine("Login successful; saved access token for future restarts.");
+            return accessToken;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Login failed: {ex.Message}");
+            return null;
         }
     }
 
@@ -283,7 +315,7 @@ public class Program
     {
         if (_backfillCollection == null) return;
 
-        var resp = await Http.GetAsync($"{homeserver}/_matrix/client/r0/joined_rooms");
+        var resp = await Http.GetAsync($"{homeserver}/_matrix/client/v3/joined_rooms");
         if (!resp.IsSuccessStatusCode)
         {
             Console.WriteLine($"joined_rooms failed: {(int)resp.StatusCode} {resp.ReasonPhrase}");
@@ -359,7 +391,7 @@ public class Program
     {
         try
         {
-            var url = $"{homeserver}/_matrix/client/r0/rooms/{Uri.EscapeDataString(roomId)}/messages?dir=b&limit=1";
+            var url = $"{homeserver}/_matrix/client/v3/rooms/{Uri.EscapeDataString(roomId)}/messages?dir=b&limit=1";
             var resp = await Http.GetAsync(url);
             if (!resp.IsSuccessStatusCode) return null;
 
@@ -409,7 +441,7 @@ public class Program
                     continue;
                 }
 
-                var url = $"{homeserver}/_matrix/client/r0/rooms/{Uri.EscapeDataString(roomId)}/messages?dir=b&limit={_backfillPageSize}&from={Uri.EscapeDataString(cursor)}";
+                var url = $"{homeserver}/_matrix/client/v3/rooms/{Uri.EscapeDataString(roomId)}/messages?dir=b&limit={_backfillPageSize}&from={Uri.EscapeDataString(cursor)}";
                 var resp = await Http.GetAsync(url);
 
                 if ((int)resp.StatusCode == 429)

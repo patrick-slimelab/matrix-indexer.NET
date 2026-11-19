@@ -278,6 +278,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
     echo "MONGODB_DB=\"${MONGODB_DB_VALUE}\""
     echo "INDEXER_ID=\"${MATRIX_USER_ID:-default}\""
     echo "INDEXER_SYNC_TOKEN_PATH=\"${STATE_DIR}/sync_token.txt\""
+    echo "INDEXER_ACCESS_TOKEN_PATH=\"${STATE_DIR}/access_token.txt\""
     echo "INDEXER_BACKFILL_PAGE_SIZE=\"200\""
     echo "INDEXER_BACKFILL_WORKERS=\"2\""
     echo "INDEXER_JOINED_ROOMS_POLL_SECONDS=\"300\""
@@ -293,7 +294,9 @@ if command -v systemctl >/dev/null 2>&1; then
 
   MANAGED_MONGO=0
   if [[ "$INSTALL_MONGO_DOCKER" == "1" && ( "$MONGODB_URI_VALUE" == mongodb://127.0.0.1:* || "$MONGODB_URI_VALUE" == mongodb://localhost:* ) ]]; then
-    if command -v docker >/dev/null 2>&1; then
+    if timeout 1 bash -lc "echo >/dev/tcp/127.0.0.1/${MONGO_PORT}" >/dev/null 2>&1; then
+      echo "[install] Existing MongoDB is listening on 127.0.0.1:${MONGO_PORT}; using it without installing a second Mongo service"
+    elif command -v docker >/dev/null 2>&1; then
       MANAGED_MONGO=1
       cat > /etc/systemd/system/matrix-indexer-mongo.service <<MONGO_UNIT
 [Unit]
